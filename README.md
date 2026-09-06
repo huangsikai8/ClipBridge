@@ -1,6 +1,13 @@
-# ClipBridge
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.svg">
+    <img src="assets/logo.svg" alt="ClipBridge" width="420">
+  </picture>
+</p>
 
-Reliable clipboard transfer between an iPad and a Mac.
+<p align="center">
+  Reliable clipboard transfer between an iPad and a Mac.
+</p>
 
 Apple's Universal Clipboard mostly works. When it doesn't, it fails silently —
 no error, no retry, no indication that the thing you copied never arrived.
@@ -232,6 +239,7 @@ external check can pass while nothing moves.
 bin/            all commands; clip dispatches to the rest
 src/            Swift sources — prefetch daemon, image read/write
 launchagents/   launchd service templates
+assets/         logo (light, dark, and a square icon)
 install.sh      build, sign, load
 uninstall.sh    stop and remove
 CLAUDE.md       architecture, traps and measured findings
