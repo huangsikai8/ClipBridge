@@ -1,0 +1,68 @@
+#!/bin/bash
+# cliphist — browse and restore clipboard entries the prefetch daemon captured.
+# This is the recovery path when a Universal Clipboard paste comes up empty
+# or stale: the text is already on the Mac, so put it back on the pasteboard.
+#
+#   cliphist            list recent entries, newest first
+#   cliphist <n>        print entry n
+#   cliphist <n> --copy restore entry n to the clipboard
+#   cliphist search <s> show entries containing <s>
+#
+# Written for the bash 3.2 that ships with macOS: no mapfile, no associative
+# arrays.
+
+set -o pipefail
+HIST="$HOME/Library/Application Support/ClipBridge/history"
+[ -d "$HIST" ] || { echo "No history yet — is the prefetch service running?"; exit 1; }
+
+FILES=()
+while IFS= read -r line; do
+  [ -n "$line" ] && FILES+=("$line")
+done < <(ls -t "$HIST" 2>/dev/null)
+
+COUNT=${#FILES[@]}
+[ "$COUNT" -eq 0 ] && { echo "History is empty."; exit 0; }
+
+pretty_time() {
+  echo "$1" | sed -E 's/^([0-9]{4}-[0-9]{2}-[0-9]{2})T([0-9]{2})-([0-9]{2})-([0-9]{2})Z-.*/\1 \2:\3:\4/'
+}
+
+if [ "${1:-}" = "search" ]; then
+  [ -z "${2:-}" ] && { echo "usage: clip hist search <text>"; exit 1; }
+  n=0; hits=0
+  for f in "${FILES[@]}"; do
+    n=$((n+1))
+    if grep -qi -- "$2" "$HIST/$f" 2>/dev/null; then
+      hits=$((hits+1))
+      printf '%3d  %s  %s\n' "$n" "$(pretty_time "$f")" "$(head -c 70 "$HIST/$f" | tr '\n' ' ')"
+    fi
+  done
+  [ "$hits" -eq 0 ] && echo "No entries matching '$2'."
+  exit 0
+fi
+
+if [ -n "${1:-}" ]; then
+  idx="$1"
+  case "$idx" in (*[!0-9]*|'') echo "usage: clip hist [n] [--copy]"; exit 1 ;; esac
+  if [ "$idx" -lt 1 ] || [ "$idx" -gt "$COUNT" ]; then
+    echo "No entry $idx (have 1-$COUNT)"; exit 1
+  fi
+  target="$HIST/${FILES[$((idx-1))]}"
+  if [ "${2:-}" = "--copy" ]; then
+    pbcopy < "$target"
+    echo "Restored entry $idx to the clipboard ($(wc -c < "$target" | tr -d ' ') bytes)."
+  else
+    cat "$target"
+  fi
+  exit 0
+fi
+
+echo "Recent clipboard entries (newest first):"
+n=0
+for f in "${FILES[@]}"; do
+  n=$((n+1))
+  [ "$n" -gt 25 ] && break
+  printf '%3d  %s  %s\n' "$n" "$(pretty_time "$f")" "$(head -c 70 "$HIST/$f" | tr '\n' ' ')"
+done
+echo
+echo "Restore with: clip hist <n> --copy   (or: clip last)   ($COUNT entries stored)"

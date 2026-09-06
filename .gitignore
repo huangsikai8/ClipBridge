@@ -1,0 +1,10 @@
+# macOS
+.DS_Store
+
+# Built artefacts — install.sh compiles and signs these locally.
+ClipBridgeAgent.app/Contents/MacOS/
+ClipBridgeAgent.app/Contents/_CodeSignature/
+bin/clip-prefetch
+
+# Generated at install time from launchagents/*.template
+launchagents/*.plist

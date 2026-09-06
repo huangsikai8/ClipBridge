@@ -1,0 +1,220 @@
+#!/bin/bash
+# clipwatch — notices when sharingd dies and comes back.
+#
+# sharingd is the daemon behind Universal Clipboard. When it crashes, launchd
+# restarts it within seconds, but the restart is silent: copies made on the
+# iPad in the gap simply never arrive, with no error anywhere in the UI.
+# This records every restart so a "the clipboard just stopped working" moment
+# can be matched against a real event instead of guessed at.
+
+set -uo pipefail
+STATE_DIR="$HOME/Library/Application Support/ClipBridge"
+mkdir -p "$STATE_DIR"
+STATE="$STATE_DIR/sharingd.pid"
+LOG="$STATE_DIR/watch.log"
+NOTIFY="${CLIPWATCH_NOTIFY:-1}"
+
+log() { printf '[%s] %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$1" >> "$LOG"; }
+
+# --- wedged-daemon detection -------------------------------------------------
+# sharingd can keep running for days and stop moving data without crashing.
+# The signature in prefetch.log is a run of REMOTE clips that arrive as a
+# header with no payload:
+#   change 3697 [REMOTE] 0ms 0B
+#   change 3699 [REMOTE] 1055ms 0B     <- spent a second fetching nothing
+# Observed 2026-09-05 after 35 hours of uptime; a restart cleared it.
+#
+# A single 0B clip is normal (an empty clipboard echoing back from a Pull),
+# so this only fires on a run of them with no healthy fetch in between.
+PREFETCH_LOG="$STATE_DIR/prefetch.log"
+LAST_FIX="$STATE_DIR/last-sharingd-fix"
+MIN_GAP=900          # never restart more than once every 15 minutes
+
+# Only the last few minutes count. Judging on the tail of the log regardless
+# of age means old entries from an already-fixed episode trigger it forever.
+# Epoch seconds when the running sharingd started. macOS ps has no `etimes`,
+# so derive it from lstart.
+sharingd_started() {
+  pid=$(pgrep -x sharingd | head -1)
+  [ -z "$pid" ] && { echo 0; return; }
+  # Trim padding; `date -j` warns about stray characters otherwise.
+  ls=$(ps -o lstart= -p "$pid" 2>/dev/null | sed 's/^ *//; s/ *$//; s/  */ /g')
+  [ -z "$ls" ] && { echo 0; return; }
+  date -j -f "%a %b %d %T %Y" "$ls" +%s 2>/dev/null || echo 0
+}
+
+wedged() {
+  [ -f "$PREFETCH_LOG" ] || return 1
+  python3 - "$PREFETCH_LOG" "$1" <<'PY'
+import sys, re, datetime
+WINDOW_MIN = 10
+rows = []
+for line in open(sys.argv[1], errors="replace"):
+    if "[REMOTE]" not in line:
+        continue
+    m = re.match(r"\[([0-9T:\-]+)Z\].*?\[REMOTE\]\s+(\d+)ms\s+(\d+)B", line)
+    if m:
+        rows.append((m.group(1), int(m.group(2)), int(m.group(3))))
+if len(rows) < 3:
+    sys.exit(1)
+last3 = rows[-3:]
+now = datetime.datetime.now(datetime.timezone.utc)
+newest = datetime.datetime.strptime(last3[-1][0], "%Y-%m-%dT%H:%M:%S").replace(
+    tzinfo=datetime.timezone.utc)
+# Stale evidence proves nothing about the present.
+if (now - newest).total_seconds() > WINDOW_MIN * 60:
+    sys.exit(1)
+# And evidence collected before the running sharingd started describes an
+# episode that has already been resolved by a restart - acting on it would
+# restart the daemon again every time the watchdog ran.
+started = int(sys.argv[2]) if len(sys.argv) > 2 else 0
+if started and newest.timestamp() < started:
+    sys.exit(1)
+# All three empty, and at least one spent real time trying to fetch.
+if not all(b == 0 for _, _, b in last3):
+    sys.exit(1)
+if not any(ms >= 100 for _, ms, _ in last3):
+    sys.exit(1)
+sys.exit(0)
+PY
+}
+
+# --- keep the peer link warm -------------------------------------------------
+# Mac -> iPad has no prefetch, so every paste there is a cold fetch: find the
+# Mac, open a session, pull the bytes. When the link has gone idle that can
+# hang -- the "stuck loading, then works on retry" symptom. Re-publishing the
+# clipboard unchanged makes the Mac announce again, which keeps the link warm.
+# Announcements are cheap; the data still only moves when someone pastes.
+#
+# EXPERIMENTAL. Disable with:
+#   touch ~/Library/Application\ Support/ClipBridge/no-keepwarm
+KEEPWARM_GAP=300     # at most every 5 minutes
+KEEPWARM_IDLE=120    # and only when nobody has touched the clipboard for 2 min
+LAST_WARM="$STATE_DIR/last-keepwarm"
+
+if [ ! -f "$STATE_DIR/no-keepwarm" ]; then
+  now=$(date +%s)
+  last=$(cat "$LAST_WARM" 2>/dev/null || echo 0)
+  if [ $((now - last)) -ge "$KEEPWARM_GAP" ]; then
+    newest=$(tail -1 "$PREFETCH_LOG" 2>/dev/null | sed -n 's/^\[\([^]]*\)\].*/\1/p')
+    idle_ok=1
+    if [ -n "$newest" ]; then
+      quiet=$(python3 -c "
+import datetime
+t=datetime.datetime.strptime('$newest','%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=datetime.timezone.utc)
+print(int((datetime.datetime.now(datetime.timezone.utc)-t).total_seconds()))" 2>/dev/null)
+      [ -n "$quiet" ] && [ "$quiet" -lt "$KEEPWARM_IDLE" ] && idle_ok=0
+    fi
+    if [ "$idle_ok" -eq 1 ]; then
+      echo "$now" > "$LAST_WARM"
+      out=$("$(dirname "$0")/clip-keepwarm" 2>&1)
+      rc=$?
+      case "$rc" in
+        0) log "keep-warm: $out" ;;
+        2) : ;;   # concealed clip - correctly refused, not worth logging
+        *) : ;;   # empty, remote, or nothing to do
+      esac
+    fi
+  fi
+fi
+# -----------------------------------------------------------------------------
+
+# --- preventive refresh ------------------------------------------------------
+# sharingd has failed three times in three days, once after ~35 hours of
+# uptime. Restarting it is cheap and launchd relaunches it immediately, so
+# retire it before it rots rather than waiting for a failure. Only while
+# idle -- the log shows nine gaps over an hour, so a quiet window is easy to
+# find and nothing in flight gets interrupted.
+MAX_AGE_H=18
+IDLE_MIN=30
+LAST_REFRESH="$STATE_DIR/last-sharingd-refresh"
+REFRESH_GAP=43200      # at most once every 12 hours
+
+should_refresh() {
+  started=$(sharingd_started)
+  [ "$started" -gt 0 ] 2>/dev/null || return 1
+  age_h=$(( ( $(date +%s) - started ) / 3600 ))
+  [ "$age_h" -ge "$MAX_AGE_H" ] || return 1
+  # Idle? The newest remote clip must be older than IDLE_MIN minutes.
+  newest=$(grep 'REMOTE' "$PREFETCH_LOG" 2>/dev/null | tail -1 | sed -n 's/^\[\([^]]*\)\].*/\1/p')
+  if [ -n "$newest" ]; then
+    idle=$(python3 -c "
+import sys,datetime
+t=datetime.datetime.strptime('$newest','%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=datetime.timezone.utc)
+print(int((datetime.datetime.now(datetime.timezone.utc)-t).total_seconds()//60))" 2>/dev/null)
+    [ -n "$idle" ] && [ "$idle" -ge "$IDLE_MIN" ] || return 1
+  fi
+  now=$(date +%s)
+  last=$(cat "$LAST_REFRESH" 2>/dev/null || echo 0)
+  [ $((now - last)) -gt "$REFRESH_GAP" ] || return 1
+  echo "$age_h"
+}
+
+if age=$(should_refresh); then
+  date +%s > "$LAST_REFRESH"
+  log "preventive refresh: sharingd up ${age}h and idle - restarting before it wedges"
+  killall sharingd 2>/dev/null
+fi
+# -----------------------------------------------------------------------------
+
+if wedged "$(sharingd_started)"; then
+  now=$(date +%s)
+  last=$(cat "$LAST_FIX" 2>/dev/null || echo 0)
+  if [ $((now - last)) -gt "$MIN_GAP" ]; then
+    echo "$now" > "$LAST_FIX"
+    log "sharingd appears wedged (remote clips arriving empty) - restarting it"
+    # Snapshot the conditions. Apple marks sharingd's own log entries private,
+    # so the cause is not visible directly; the only way to find a pattern is
+    # to record the surroundings each time it happens and compare episodes.
+    {
+      echo "--- wedge at $(date -u '+%Y-%m-%dT%H:%M:%SZ') ---"
+      echo "sharingd uptime : $(ps -o etime= -p "$(pgrep -x sharingd | head -1)" 2>/dev/null | tr -d ' ')"
+      echo "bluetoothd up   : $(ps -o etime= -p "$(pgrep -x bluetoothd | head -1)" 2>/dev/null | tr -d ' ')"
+      echo "boot            : $(sysctl -n kern.boottime 2>/dev/null | sed 's/.*} //')"
+      echo "last wake       : $(pmset -g log 2>/dev/null | awk '$4=="Wake"{l=$1" "$2} END{print l}')"
+      echo "wifi ip         : $(ipconfig getifaddr en0 2>/dev/null)"
+      echo "gateway         : $(route -n get default 2>/dev/null | awk '/gateway/{print $2}')"
+      echo "awdl0           : $(ifconfig awdl0 2>/dev/null | awk '/status/{print $2}')"
+      echo "power           : $(pmset -g batt 2>/dev/null | head -1)"
+      echo "tailscale       : $(pgrep -x tailscaled >/dev/null 2>&1 && echo running || echo "$( [ -x "$HOME/.local/bin/tailscale" ] && "$HOME/.local/bin/tailscale" status 2>&1 | head -1 )")"
+      echo "recent remote   :"
+      grep 'REMOTE' "$PREFETCH_LOG" 2>/dev/null | tail -5 | sed 's/^/  /'
+      echo
+    } >> "$STATE_DIR/wedge-history.log" 2>/dev/null
+    killall sharingd 2>/dev/null
+    if [ "$NOTIFY" = "1" ]; then
+      osascript -e 'display notification "Clipboard sharing had stopped moving data. Restarted it." with title "Universal Clipboard"' 2>/dev/null
+    fi
+  fi
+fi
+# -----------------------------------------------------------------------------
+
+CUR=$(pgrep -x sharingd | head -1)
+
+if [[ -z "$CUR" ]]; then
+  log "sharingd NOT running"
+  exit 0
+fi
+
+if [[ ! -f "$STATE" ]]; then
+  echo "$CUR" > "$STATE"
+  log "baseline sharingd pid=$CUR"
+  exit 0
+fi
+
+PREV=$(cat "$STATE" 2>/dev/null)
+if [[ "$CUR" != "$PREV" ]]; then
+  echo "$CUR" > "$STATE"
+  RECENT=$(find "$HOME/Library/Logs/DiagnosticReports" -name 'sharingd-*.ips' -mmin -10 2>/dev/null | head -1)
+  if [[ -n "$RECENT" ]]; then
+    log "sharingd RESTARTED after a crash (pid $PREV -> $CUR, report: $(basename "$RECENT"))"
+    MSG="sharingd crashed and restarted. Clipboard copies made on your iPad in the last few minutes may not have arrived."
+  else
+    log "sharingd restarted (pid $PREV -> $CUR, no crash report found)"
+    MSG="sharingd restarted. Re-copy on the iPad if a paste comes up empty."
+  fi
+  if [[ "$NOTIFY" == "1" ]]; then
+    osascript -e "display notification \"$MSG\" with title \"Universal Clipboard\"" 2>/dev/null
+  fi
+fi
+exit 0

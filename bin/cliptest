@@ -1,0 +1,79 @@
+#!/bin/bash
+# cliptest — verify the Tailscale route end to end, and say what is missing.
+#
+# Checks in dependency order and stops at the first thing that is broken, so
+# you fix one thing rather than reading four green ticks and one puzzle.
+
+if [ -t 1 ]; then
+  G=$'\033[32m'; Y=$'\033[33m'; R=$'\033[31m'; B=$'\033[1m'; D=$'\033[2m'; N=$'\033[0m'
+else G=""; Y=""; R=""; B=""; D=""; N=""; fi
+
+TS=""
+for c in "$HOME/.local/bin/tailscale" /Applications/Tailscale.app/Contents/MacOS/Tailscale; do
+  [ -x "$c" ] && { TS="$c"; break; }
+done
+
+echo
+echo "${B}TAILSCALE ROUTE TEST${N}"
+
+if [ -z "$TS" ]; then
+  echo "  ${R}x${N} Tailscale is not installed"
+  echo "     ${D}brew install --cask tailscale-app${N}"; echo; exit 1
+fi
+
+st=$("$TS" status 2>&1)
+if echo "$st" | grep "Tailscale is stopped" >/dev/null 2>&1; then
+  echo "  ${R}x${N} Tailscale is OFF on this Mac"
+  echo "     ${B}Fix: tailscale up${N}   ${D}(or the menu bar icon -> Connect)${N}"
+  echo; echo "  ${D}Both devices must be on. Turn it on here, then on the iPad.${N}"; echo
+  exit 1
+fi
+me=$("$TS" ip -4 2>/dev/null | head -1)
+echo "  ${G}o${N} Tailscale on, this Mac is $me"
+
+host=$("$TS" status --json 2>/dev/null | python3 -c '
+import sys,json
+try: print((json.load(sys.stdin).get("Self") or {}).get("DNSName","").rstrip("."))
+except Exception: print("")')
+[ -n "$host" ] && echo "  ${G}o${N} Mac hostname: ${B}$host${N}"
+
+read -r ip online name <<EOF2
+$("$TS" status --json 2>/dev/null | python3 -c '
+import sys,json
+d=json.load(sys.stdin)
+for p in (d.get("Peer") or {}).values():
+    if p.get("OS") in ("iOS","ipados"):
+        print((p.get("TailscaleIPs") or [""])[0], p.get("Online"), p.get("DNSName","").split(".")[0]); break')
+EOF2
+
+if [ -z "$ip" ]; then
+  echo "  ${R}x${N} no iPad found on your tailnet"
+  echo "     ${D}Install Tailscale on the iPad and sign into the same account.${N}"; echo; exit 1
+fi
+if [ "$online" != "True" ]; then
+  echo "  ${R}x${N} iPad ($name) is OFFLINE on the tailnet"
+  echo "     ${B}Fix: turn Tailscale ON on the iPad${N}"; echo; exit 1
+fi
+echo "  ${G}o${N} iPad online: $name ($ip)"
+
+probe=$("$TS" ping --c 4 --timeout 8s "$ip" 2>&1)
+if echo "$probe" | grep "pong" >/dev/null 2>&1; then
+  path=$(echo "$probe" | grep pong | tail -1 | sed -n 's/.*via \([^ ]*\).*/\1/p')
+  echo "  ${G}o${N} reachable ${D}(via $path)${N}"
+else
+  echo "  ${R}x${N} cannot reach the iPad over the tailnet"; echo; exit 1
+fi
+
+out=$(ssh -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=no \
+      "$(whoami)@$host" true 2>&1)
+case "$out" in
+  *"Permission denied"*) echo "  ${G}o${N} sshd answers on the Tailscale address" ;;
+  "")                    echo "  ${G}o${N} sshd answers on the Tailscale address" ;;
+  *) echo "  ${R}x${N} sshd unreachable on $host"; echo "     ${D}$out${N}"; echo; exit 1 ;;
+esac
+
+echo
+echo "  ${G}${B}Tailscale route is working.${N}"
+echo "  Put this in the Shortcut's Host field:"
+echo "     ${B}$host${N}"
+echo

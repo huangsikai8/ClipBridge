@@ -1,0 +1,59 @@
+#!/bin/bash
+# autopaste — paste clips from the iPad automatically as they arrive.
+#
+#   autopaste up      on
+#   autopaste down    off
+#   autopaste         current state
+#
+# When on, a clip arriving from the iPad triggers Cmd-V into whatever window
+# is focused. It fires wherever your focus happens to be, which is the whole
+# point and also the whole risk: a multi-line clip landing in a terminal can
+# execute. Off by default.
+#
+# Never fires for: clips you copied on this Mac, clips that arrived empty,
+# re-announcements of a clip already pasted, or anything a password manager
+# marked concealed.
+
+STATE_DIR="$HOME/Library/Application Support/ClipBridge"
+FLAG="$STATE_DIR/autopaste"
+APP="$HOME/Scripts/ClipBridge/ClipBridgeAgent.app"
+mkdir -p "$STATE_DIR"
+
+if [ -t 1 ]; then G=$'\033[32m'; R=$'\033[31m'; Y=$'\033[33m'; B=$'\033[1m'; D=$'\033[2m'; N=$'\033[0m'
+else G=""; R=""; Y=""; B=""; D=""; N=""; fi
+
+granted() {
+  osascript -e 'tell application "System Events" to return true' >/dev/null 2>&1
+}
+
+case "${1:-}" in
+  up|on|start)
+    touch "$FLAG"
+    echo "${G}autopaste is UP${N} — clips from the iPad will paste themselves"
+    echo
+    if ! granted; then
+      echo "  ${Y}Accessibility is not granted yet.${N} Until it is, nothing will paste."
+      echo "  System Settings > Privacy & Security > Accessibility, then + and choose:"
+      echo "    ${B}$APP${N}"
+      echo "  ${D}(In Finder press Cmd-Shift-G and paste that path.)${N}"
+      echo
+    fi
+    echo "  ${D}It pastes into whatever is focused. Watch out for terminals:${N}"
+    echo "  ${D}multi-line text pasted into a shell can run.${N}"
+    ;;
+  down|off|stop)
+    rm -f "$FLAG"
+    echo "${R}autopaste is DOWN${N} — clips arrive as normal, paste them yourself"
+    ;;
+  ""|status)
+    if [ -f "$FLAG" ]; then
+      echo "autopaste: ${G}UP${N}"
+      granted || echo "  ${Y}but Accessibility is not granted, so nothing will paste${N}"
+    else
+      echo "autopaste: ${R}DOWN${N}"
+    fi
+    echo "${D}  autopaste up | autopaste down${N}"
+    ;;
+  *)
+    echo "usage: autopaste [up|down]" >&2; exit 1 ;;
+esac

@@ -1,0 +1,53 @@
+#!/bin/bash
+# clip-addkey — authorise the iPad's SSH public key, taken from the clipboard.
+#
+# Shortcuts can generate a key pair inside the Run Script Over SSH action and
+# copy the public half. Send that to the Mac (Universal Clipboard, or paste it
+# into a note) and run this: it validates the key, appends it to
+# authorized_keys, and sets the permissions sshd insists on.
+
+set -o pipefail
+SSH_DIR="$HOME/.ssh"
+AUTH="$SSH_DIR/authorized_keys"
+
+key=$(pbpaste)
+if [ -z "$key" ]; then
+  echo "Clipboard is empty. Copy the iPad's public key first."; exit 1
+fi
+
+# One line, starting with a key type. Anything else is not a public key —
+# most often the PRIVATE half, which must never end up here.
+case "$key" in
+  *"PRIVATE KEY"*)
+    echo "That is a PRIVATE key. Copy the public half instead (it starts with ssh-)."; exit 1 ;;
+  ssh-rsa\ *|ssh-ed25519\ *|ecdsa-sha2-*\ *|sk-ssh-ed25519*|sk-ecdsa-*) ;;
+  *)
+    echo "Clipboard does not look like an SSH public key."
+    echo "Expected it to start with ssh-ed25519, ssh-rsa or ecdsa-sha2-."
+    echo "Got: $(printf '%s' "$key" | head -c 60)..."
+    exit 1 ;;
+esac
+
+if [ "$(printf '%s' "$key" | wc -l | tr -d ' ')" -gt 0 ]; then
+  echo "Public key should be a single line. Check what was copied."; exit 1
+fi
+
+mkdir -p "$SSH_DIR"
+chmod 700 "$SSH_DIR"
+touch "$AUTH"
+chmod 600 "$AUTH"
+
+fingerprint=$(printf '%s\n' "$key" | ssh-keygen -lf - 2>/dev/null)
+
+if grep -qF "$(printf '%s' "$key" | awk '{print $2}')" "$AUTH" 2>/dev/null; then
+  echo "That key is already authorised."
+  echo "  $fingerprint"
+  exit 0
+fi
+
+printf '%s\n' "$key" >> "$AUTH"
+echo "Authorised the key for $(whoami)@$(scutil --get LocalHostName).local"
+echo "  $fingerprint"
+echo
+echo "Test it from the iPad Shortcut now. If it still asks for a password,"
+echo "check that Remote Login lists your account under 'Only these users'."

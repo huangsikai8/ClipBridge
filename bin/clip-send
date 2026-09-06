@@ -1,0 +1,83 @@
+#!/bin/bash
+# clip-send — emit this Mac's clipboard for the iPad to pull over SSH.
+#
+# Text goes out as plain text; the SSH action returns stdout as-is, so no
+# encoding and no Decode step on the iPad. Images are binary, so they go out
+# as a marker prefix followed by base64 PNG and the Shortcut branches on it.
+#
+#   __CLIPBRIDGE_PNG__iVBORw0KGgoAAAANSUhEUg...   (one single line)
+#
+#   clip-send         text raw, images marked + base64
+#   clip-send --image bare base64 PNG, no marker
+#   clip-send --b64   force base64 for everything
+#
+# Serves a cached copy when the pasteboard has been emptied. Pulling sets the
+# iPad's clipboard, the iPad announces that back over Universal Clipboard, and
+# the announcement arrives with no payload -- which wipes whatever was on the
+# Mac about a second after a successful pull. Measured:
+#   01:50:52 sent 61798 bytes (png)
+#   01:50:53 change [REMOTE] 0B got=[]      <- clipboard destroyed
+#   01:51:11 sent 0 bytes (text)            <- second pull came back empty
+# Without the cache, every image could only ever be pulled once.
+
+set -o pipefail
+BIN="$(cd "$(dirname "$0")" && pwd)"
+LOGDIR="$HOME/Library/Application Support/ClipBridge"
+mkdir -p "$LOGDIR"
+CACHE_IMG="$LOGDIR/last-sent.png"
+CACHE_TXT="$LOGDIR/last-sent.txt"
+
+route_tag() {
+  set -- $SSH_CONNECTION
+  src="${1:-local-shell}"
+  case "$src" in
+    100.*) echo "via tailscale $src" ;;
+    local-shell) echo "via local-shell" ;;
+    *) echo "via lan $src" ;;
+  esac
+}
+
+tmp=$(mktemp -t clipsend) || exit 1
+trap 'rm -f "$tmp"' EXIT
+
+log() { printf '[%s] sent %s bytes to iPad (%s) %s\n' \
+        "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$1" "$2" "$(route_tag)" >> "$LOGDIR/bridge.log"; }
+
+emit_image() {   # $1 = png file, $2 = "live" | "cached"
+  log "$(wc -c < "$1" | tr -d ' ')" "png${2:+ $2}"
+  [ "${MODE:-}" = "--image" ] || printf '__CLIPBRIDGE_PNG__'
+  base64 < "$1"
+  exit 0
+}
+
+MODE="${1:-}"
+
+# Image first: an image copy often leaves stale text on the pasteboard too.
+if "$BIN/clip-image" > "$tmp" 2>/dev/null && [ -s "$tmp" ]; then
+  cp "$tmp" "$CACHE_IMG"; rm -f "$CACHE_TXT"
+  emit_image "$tmp" ""
+fi
+
+pbpaste > "$tmp" 2>/dev/null
+if [ -s "$tmp" ]; then
+  cp "$tmp" "$CACHE_TXT"; rm -f "$CACHE_IMG"
+  bytes=$(wc -c < "$tmp" | tr -d ' ')
+  if [ "$MODE" = "--b64" ]; then log "$bytes" "base64"; base64 < "$tmp"; else log "$bytes" "text"; cat "$tmp"; fi
+  exit 0
+fi
+
+# Pasteboard is empty. Fall back to whatever was last sent successfully.
+if [ -s "$CACHE_IMG" ]; then
+  emit_image "$CACHE_IMG" "cached"
+fi
+if [ -s "$CACHE_TXT" ] && [ "$MODE" != "--image" ]; then
+  log "$(wc -c < "$CACHE_TXT" | tr -d ' ')" "text cached"
+  cat "$CACHE_TXT"
+  exit 0
+fi
+
+if [ "$MODE" = "--image" ]; then
+  echo "clip-send: no image on the Mac clipboard" >&2
+  exit 1
+fi
+log "0" "empty, nothing cached"

@@ -1,0 +1,35 @@
+#!/usr/bin/env python3
+"""clip-pageurl - print the URL a saved web page describes, or nothing.
+
+Copying a link in Safari on iOS puts the whole page HTML on the clipboard
+alongside the URL, and Shortcuts hands over the richest representation, so a
+link can arrive as most of a megabyte of page source. Reducing it back to the
+URL has to happen here rather than on the iPad: coercing the clipboard to text
+there would fix links but destroy images.
+"""
+import re
+import sys
+
+PATTERNS = (
+    r'<link[^>]+rel=["\']canonical["\'][^>]*href=["\']([^"\']+)',
+    r'<meta[^>]+property=["\']og:url["\'][^>]*content=["\']([^"\']+)',
+    r'<meta[^>]+id=["\']english-canonical-url["\'][^>]*content=["\']([^"\']+)',
+)
+
+def main() -> int:
+    if len(sys.argv) < 2:
+        return 1
+    try:
+        head = open(sys.argv[1], errors="replace").read(500_000)
+    except OSError:
+        return 1
+    if not re.match(r'\s*(<!doctype html|<html)', head, re.I):
+        return 1
+    for pattern in PATTERNS:
+        m = re.search(pattern, head, re.I)
+        if m and m.group(1).startswith("http"):
+            print(m.group(1))
+            return 0
+    return 1
+
+sys.exit(main())

@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Template. install.sh substitutes __CLIPBRIDGE_DIR__ and __HOME__ and
+     writes the result to ~/Library/LaunchAgents. launchd will not expand
+     $HOME or a relative path, so the absolute paths have to be baked in at
+     install time rather than committed. -->
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.sikai.clipbridge.prefetch</string>
+    <key>ProgramArguments</key>
+    <array><string>__CLIPBRIDGE_DIR__/ClipBridgeAgent.app/Contents/MacOS/clip-prefetch</string></array>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><true/>
+    <key>ThrottleInterval</key><integer>10</integer>
+    <key>StandardOutPath</key><string>__HOME__/Library/Application Support/ClipBridge/prefetch.out</string>
+    <key>StandardErrorPath</key><string>__HOME__/Library/Application Support/ClipBridge/prefetch.err</string>
+</dict>
+</plist>

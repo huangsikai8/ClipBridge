@@ -1,0 +1,286 @@
+#!/bin/bash
+# clipdoctor — diagnose and repair the Universal Clipboard transport.
+#
+# Universal Clipboard does NOT use Ethernet, Thunderbolt bridge, or your
+# router. It uses Bluetooth LE to announce that a clipboard exists, and
+# AWDL (peer-to-peer Wi-Fi) to move the bytes. Wi-Fi must be POWERED ON
+# even when all your real traffic goes over a cable.
+
+set -uo pipefail
+REPAIR=0
+[[ "${1:-}" == "--repair" ]] && REPAIR=1
+
+ok=0; warn=0; fail=0
+green() { printf '  \033[32mOK\033[0m   %s\n' "$1"; ok=$((ok+1)); }
+yellow(){ printf '  \033[33mWARN\033[0m %s\n' "$1"; warn=$((warn+1)); }
+red()   { printf '  \033[31mFAIL\033[0m %s\n' "$1"; fail=$((fail+1)); }
+
+# Wait for a clip to arrive from the iPad. Returns 0 if one does.
+# This is the only test available for the far end: iOS exposes no processes,
+# so the iPad's daemon can only be judged by whether it announces anything.
+watch_for_clip() {
+  local secs="${1:-45}"
+  local LOG="$HOME/Library/Application Support/ClipBridge/prefetch.log"
+  local before now line i
+  before=$(grep -c 'REMOTE' "$LOG" 2>/dev/null || echo 0)
+  echo "  Copy something on the iPad now. Waiting ${secs}s..."
+  for i in $(seq "$secs"); do
+    now=$(grep -c 'REMOTE' "$LOG" 2>/dev/null || echo 0)
+    if [[ "$now" -gt "$before" ]]; then
+      line=$(grep 'REMOTE' "$LOG" | tail -1 | sed 's/ skipped=.*//')
+      printf '\r  \033[32mARRIVED\033[0m after %ds\n' "$i"
+      echo "  $line"
+      return 0
+    fi
+    printf '\r  %2ds' "$i"
+    sleep 1
+  done
+  printf '\r        \r'
+  return 1
+}
+
+recovery_steps() {
+  echo "  Green checks do NOT mean sharingd is working: it can be running,"
+  echo "  advertising and enabled while silently failing to move data. The"
+  echo "  checks cannot see inside it. Seen twice: 2026-09-04, announcements"
+  echo "  arriving empty; 2026-09-05, none arriving at all."
+  echo "  A restart here is cheap and sometimes enough, but not guaranteed --"
+  echo "  on 2026-09-05 the first restart did not help and recovery came later."
+  echo
+  echo "  Try in this order, copying on the iPad after each:"
+  echo "    1. clip fix                     restart sharingd here - cheap, often enough"
+  echo "    2. iPad: Handoff off, then on   Settings > General > AirPlay & Continuity"
+  echo "    3. iPad: Bluetooth off 10s, on"
+  echo "    4. Restart the iPad             it has no equivalent of --repair"
+  echo
+  echo "  If the clipboard is dead but everything above is green, that is the"
+  echo "  daemon failing invisibly -- not a reason to look elsewhere first."
+}
+
+# There is no way to inspect sharingd on the iPad -- iOS exposes no processes.
+# The only test available is behavioural: copy something there and see whether
+# this Mac is told about it within a few seconds.
+if [[ "${1:-}" == "--watch" ]]; then
+  echo
+  echo "Testing whether the iPad is announcing clipboards."
+  if watch_for_clip 10; then
+    echo
+    echo "  The iPad is announcing normally."
+    exit 0
+  fi
+  printf '  \033[31mNOTHING ARRIVED\033[0m in 10s\n'
+  echo
+  recovery_steps
+  exit 1
+fi
+
+if [[ "${1:-}" == "--steps" || "${1:-}" == "--help" ]]; then
+  echo
+  echo "Recovery steps when the clipboard stops working"
+  echo
+  recovery_steps
+  echo
+  echo "  clip           status and which route works"
+  echo "  clip fix       restart the sharing daemon"
+  echo "  clip last      put the last clip back"
+  echo
+  exit 0
+fi
+
+echo "Universal Clipboard health check — $(date '+%Y-%m-%d %H:%M:%S')"
+echo
+
+echo "Transport"
+WIFI_DEV=$(networksetup -listallhardwareports | awk '/Hardware Port: Wi-Fi/{getline; print $2}')
+if [[ -n "$WIFI_DEV" ]] && networksetup -getairportpower "$WIFI_DEV" 2>/dev/null | grep -q ": On"; then
+  green "Wi-Fi radio powered on ($WIFI_DEV) — required for AWDL"
+else
+  red "Wi-Fi radio is OFF. Universal Clipboard cannot work. Turn Wi-Fi on."
+  [[ $REPAIR -eq 1 && -n "$WIFI_DEV" ]] && networksetup -setairportpower "$WIFI_DEV" on && echo "       -> switched Wi-Fi on"
+fi
+
+if ifconfig awdl0 2>/dev/null | grep -q "status: active"; then
+  green "AWDL peer-to-peer link is up (awdl0)"
+else
+  red "awdl0 is down — the peer-to-peer link Universal Clipboard transfers over"
+fi
+
+BT_STATE=$(system_profiler SPBluetoothDataType -json 2>/dev/null \
+  | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d.get("SPBluetoothDataType",[{}])[0].get("controller_properties",{}).get("controller_state",""))' 2>/dev/null)
+if [[ "$BT_STATE" == "attrib_on" ]]; then
+  green "Bluetooth is on — required to announce clipboard availability"
+else
+  red "Bluetooth is off. The iPad cannot announce a clipboard to this Mac."
+fi
+
+if scutil --nc list 2>/dev/null | grep -q "^Connected"; then
+  yellow "A VPN is connected — VPNs commonly break Handoff discovery"
+else
+  green "No active VPN"
+fi
+
+echo
+echo "Handoff / iCloud"
+ADV=$(defaults -currentHost read com.apple.coreservices.useractivityd ActivityAdvertisingAllowed 2>/dev/null)
+RCV=$(defaults -currentHost read com.apple.coreservices.useractivityd ActivityReceivingAllowed 2>/dev/null)
+if [[ "$ADV" == "1" && "$RCV" == "1" ]]; then
+  green "Handoff enabled in both directions"
+else
+  red "Handoff disabled (advertising=$ADV receiving=$RCV)"
+  if [[ $REPAIR -eq 1 ]]; then
+    defaults -currentHost write com.apple.coreservices.useractivityd ActivityAdvertisingAllowed -bool true
+    defaults -currentHost write com.apple.coreservices.useractivityd ActivityReceivingAllowed -bool true
+    echo "       -> re-enabled Handoff"
+  fi
+fi
+
+ACCT=$(defaults read ~/Library/Preferences/MobileMeAccounts.plist 2>/dev/null \
+  | grep -m1 'AccountID' | awk -F'"' '{print $2}')
+if [[ -n "$ACCT" ]]; then
+  green "Signed into iCloud as $ACCT (the iPad must match exactly)"
+else
+  yellow "Could not read the iCloud account from this Mac"
+fi
+
+echo
+echo "Daemons"
+SPID=$(pgrep -x sharingd | head -1)
+if [[ -n "$SPID" ]]; then
+  AGE=$(ps -o etime= -p "$SPID" | tr -d ' ')
+  green "sharingd running (pid $SPID, up $AGE)"
+else
+  red "sharingd is NOT running — Universal Clipboard is dead until it returns"
+fi
+
+CRASHES=$(find ~/Library/Logs/DiagnosticReports -name 'sharingd-*.ips' -mtime -7 2>/dev/null | wc -l | tr -d ' ')
+if [[ "$CRASHES" -gt 0 ]]; then
+  yellow "sharingd crashed $CRASHES time(s) in the last 7 days:"
+  find ~/Library/Logs/DiagnosticReports -name 'sharingd-*.ips' -mtime -7 2>/dev/null \
+    | sort | sed 's|.*/|       |'
+  yellow "Each crash silently stops clipboard handoff until sharingd is poked."
+else
+  green "No sharingd crashes in the last 7 days"
+fi
+
+echo
+echo "Incoming from the iPad"
+# Every check above is local. The one thing that proves the whole path works
+# is a clip actually arriving -- so report when one last did, and if the Mac
+# is healthy but nothing has come through, say plainly that the fault is at
+# the other end. Otherwise an all-green report sends you hunting here.
+LASTREMOTE=$(grep 'REMOTE' "$HOME/Library/Application Support/ClipBridge/prefetch.log" 2>/dev/null \
+             | tail -1 | sed -n 's/^\[\([^]]*\)\].*/\1/p')
+STALE=0
+if [[ -z "$LASTREMOTE" ]]; then
+  yellow "No clip has ever arrived from the iPad"
+  STALE=1
+else
+  AGEMIN=$(python3 -c "
+import sys,datetime
+t=datetime.datetime.strptime('$LASTREMOTE','%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=datetime.timezone.utc)
+print(int((datetime.datetime.now(datetime.timezone.utc)-t).total_seconds()//60))" 2>/dev/null)
+  if [[ -n "$AGEMIN" && "$AGEMIN" -gt 120 ]]; then
+    if   [[ "$AGEMIN" -gt 1440 ]]; then AGE="$((AGEMIN/1440)) day(s)"
+    else AGE="$((AGEMIN/60)) hours"; fi
+    yellow "Last clip from the iPad arrived $AGE ago"
+    STALE=1
+  else
+    green "Last clip from the iPad arrived $AGEMIN min ago"
+  fi
+fi
+
+# A push proves the iPad had something on its clipboard at a known moment.
+# If no clip was announced around that time, Universal Clipboard was provably
+# down -- not merely unused. This is the only way to tell "broken" apart from
+# "you did not copy anything", which silence alone cannot distinguish.
+PROOF=$(python3 - "$HOME/Library/Application Support/ClipBridge" <<'PY' 2>/dev/null
+import os, re, sys, datetime
+d = sys.argv[1]
+def stamps(path, pat):
+    out = []
+    try:
+        for line in open(os.path.join(d, path), errors="replace"):
+            if re.search(pat, line):
+                m = re.match(r"\[([0-9T:\-]+)Z\]", line)
+                if m:
+                    out.append(datetime.datetime.strptime(m.group(1), "%Y-%m-%dT%H:%M:%S"))
+    except OSError:
+        pass
+    return out
+pushes = stamps("bridge.log", r"received \d+ bytes from iPad")
+remotes = stamps("prefetch.log", r"\[REMOTE\]")
+if not pushes:
+    sys.exit(0)
+last = pushes[-1]
+near = [r for r in remotes if abs((r - last).total_seconds()) <= 180]
+age = (datetime.datetime.utcnow() - last).total_seconds() / 60
+if not near and age < 720:
+    print("%s|%d" % (last.strftime("%H:%M"), age))
+PY
+)
+if [[ -n "$PROOF" ]]; then
+  PT="${PROOF%%|*}"
+  echo
+  red "You pushed from the iPad at ${PT}Z but no clipboard was announced then."
+  echo "       That is proof Universal Clipboard was down, not merely unused:"
+  echo "       the iPad had content and the Mac never heard about it."
+fi
+
+if [[ $fail -eq 0 && $STALE -eq 1 ]]; then
+  echo
+  printf '  \033[33mEvery check here passes, but nothing is arriving.\033[0m\n'
+  echo "  If you have copied on the iPad recently, see the steps below."
+fi
+
+echo
+if [[ $REPAIR -eq 1 ]]; then
+  echo "Repairing"
+  killall sharingd 2>/dev/null && echo "  restarted sharingd (launchd relaunches it automatically)" \
+    || echo "  sharingd was not running; launchd will start it"
+  VERIFY=1
+  if command -v blueutil >/dev/null 2>&1; then
+    blueutil -p 0 && perl -e 'select(undef,undef,undef,2)' && blueutil -p 1 \
+      && echo "  cycled Bluetooth"
+  else
+    echo "  (install blueutil to let --repair cycle Bluetooth: brew install blueutil)"
+  fi
+  echo
+fi
+
+printf 'Summary: %d ok, %d warnings, %d failures\n' "$ok" "$warn" "$fail"
+
+
+[[ $REPAIR -eq 0 && $fail -gt 0 ]] && echo "Run 'clip fix' to attempt an automatic fix."
+
+# A repair that does not say whether it worked leaves you exactly where you
+# started. Verify against the far end, and name the side still at fault.
+if [[ "${VERIFY:-0}" -eq 1 ]]; then
+  echo
+  echo "Verifying"
+  sleep 3          # let the daemon settle before judging it
+  if watch_for_clip 10; then
+    echo
+    printf '  \033[32mFixed.\033[0m The clipboard is working again.\n'
+    echo
+    exit 0
+  fi
+  printf '  \033[31mStill nothing.\033[0m\n'
+  echo
+  echo "  This Mac passes every check and its daemon has just been restarted,"
+  echo "  so the fault is on the iPad. Nothing here can reach it."
+  echo
+  echo "  On the iPad, copying something after each step:"
+  echo "    1. Settings > General > AirPlay & Continuity > Handoff - off, then on"
+  echo "    2. Settings > Bluetooth - off, wait 10s, on"
+  echo "    3. Restart the iPad"
+  echo
+  echo "  The Push and Pull shortcuts keep working throughout - they do not"
+  echo "  use the clipboard daemon at all."
+  echo
+  exit 1
+fi
+
+echo
+echo "If the clipboard is not working"
+recovery_steps
+exit 0

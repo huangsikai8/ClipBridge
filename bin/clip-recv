@@ -1,0 +1,89 @@
+#!/bin/bash
+# clip-recv — set this Mac's clipboard from whatever the iPad sent over SSH.
+#
+# Everything arrives base64-encoded so it survives the SSH channel. What it is
+# gets decided here, from the bytes, rather than by the Shortcut declaring it:
+#
+#   image magic bytes  -> put on the pasteboard as an image (pbcopy cannot)
+#   a full HTML page   -> reduced to the URL it describes (see clip-pageurl)
+#   anything else      -> plain text
+#
+#   clip-recv --b64 <base64>    (or base64 on stdin)
+#   clip-recv                   raw text on stdin
+
+set -o pipefail
+BIN="$(cd "$(dirname "$0")" && pwd)"
+LOGDIR="$HOME/Library/Application Support/ClipBridge"
+mkdir -p "$LOGDIR"
+
+route_tag() {
+  set -- $SSH_CONNECTION
+  src="${1:-local-shell}"
+  case "$src" in
+    100.*) echo "via tailscale $src" ;;
+    local-shell) echo "via local-shell" ;;
+    *) echo "via lan $src" ;;
+  esac
+}
+logline() { printf '[%s] %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$1" >> "$LOGDIR/bridge.log"; }
+
+tmp=$(mktemp -t cliprecv) || exit 1
+trap 'rm -f "$tmp" "$tmp.in"' EXIT
+
+logline "clip-recv invoked (args: $# )"
+
+if [ "${1:-}" = "--b64" ]; then
+  if [ -n "${2:-}" ]; then
+    raw="$2"
+    printf '%s' "$raw" | tr -d '[:space:]' | base64 --decode > "$tmp" 2>/dev/null
+    rc=$?
+  else
+    cat > "$tmp.in"
+    raw=$(head -c 120 "$tmp.in")
+    tr -d '[:space:]' < "$tmp.in" | base64 --decode > "$tmp" 2>/dev/null
+    rc=$?
+  fi
+  if [ "$rc" -ne 0 ] || [ ! -s "$tmp" ]; then
+    snippet=$(printf '%s' "$raw" | head -c 60 | tr -d '\n')
+    if [ -z "$snippet" ]; then
+      logline "nothing to send - the iPad clipboard was empty $(route_tag)"
+      echo "clip-recv: the iPad clipboard was empty, nothing to copy" >&2
+      exit 1
+    fi
+    logline "FAILED: input was not valid base64 -- first 60 chars: [$snippet] $(route_tag)"
+    echo "clip-recv: input was not valid base64" >&2
+    echo "got: $snippet" >&2
+    exit 1
+  fi
+else
+  cat > "$tmp"
+fi
+
+bytes=$(wc -c < "$tmp" | tr -d ' ')
+magic=$(head -c 12 "$tmp" 2>/dev/null | od -An -tx1 | tr -d ' \n')
+
+kind="text"
+case "$magic" in
+  89504e47*)  kind="image" ;;   # PNG
+  ffd8ff*)    kind="image" ;;   # JPEG
+  47494638*)  kind="image" ;;   # GIF
+  *66747970*) kind="image" ;;   # ftyp box — HEIC / HEIF
+esac
+
+if [ "$kind" = "image" ] && dims=$("$BIN/clip-setimage" "$tmp" 2>/dev/null); then
+  logline "received $bytes bytes from iPad ($dims) $(route_tag)"
+  echo "ok:image:$bytes"
+  exit 0
+fi
+
+if url=$("$BIN/clip-pageurl" "$tmp" 2>/dev/null) && [ -n "$url" ]; then
+  cp "$tmp" "$LOGDIR/last-page.html" 2>/dev/null   # keep the page, don't discard it
+  printf '%s' "$url" | pbcopy
+  logline "received $bytes bytes from iPad (web page -> url) $(route_tag)"
+  echo "ok:url:$url"
+  exit 0
+fi
+
+pbcopy < "$tmp"
+logline "received $bytes bytes from iPad (text) $(route_tag)"
+echo "ok:$bytes"

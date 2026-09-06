@@ -1,0 +1,58 @@
+#!/bin/bash
+# clip — the single entry point.
+#
+# The pieces underneath still exist in ~/Scripts/ClipBridge/bin and still work
+# if called directly; this is the one name worth remembering.
+#
+#   clip          how is the clipboard, and which route works here
+#   clip fix      restart the sharing daemon on this Mac
+#   clip last     put the last clip back on the clipboard
+#
+# Rarely needed: hist (browse clips), check (full prerequisite check),
+# net (test the Tailscale route), key (authorise an iPad SSH key).
+
+# Resolve through the symlink on PATH, or BIN points at ~/.local/bin
+# and every subcommand fails with "No such file or directory".
+SELF="$0"
+while [ -L "$SELF" ]; do
+  link="$(readlink "$SELF")"
+  case "$link" in
+    /*) SELF="$link" ;;
+    *)  SELF="$(dirname "$SELF")/$link" ;;
+  esac
+done
+BIN="$(cd "$(dirname "$SELF")" && pwd)"
+
+case "${1:-}" in
+  ""|status)  exec "$BIN/clipstatus" ;;
+  fix|repair) exec "$BIN/clipdoctor" --repair ;;
+  test|watch) exec "$BIN/clipdoctor" --watch ;;
+  check|full) exec "$BIN/clipdoctor" ;;
+  last)       exec "$BIN/cliphist" 1 --copy ;;
+  hist)       shift; exec "$BIN/cliphist" "$@" ;;
+  key)        exec "$BIN/clip-addkey" ;;
+  autopaste)  shift; exec "$BIN/autopaste" "$@" ;;
+  reload)     exec "$BIN/../install.sh" ;;
+  net)        exec "$BIN/cliptest" ;;
+  help|-h|--help)
+    cat <<'USAGE'
+
+  clip          how is the clipboard, and which route works here
+  clip fix      restart the sharing daemon on this Mac
+  clip last     put the last clip back on the clipboard
+
+  To check the iPad is announcing: copy something there, then run clip.
+  "last iPad copy 0 min ago" means it is working.
+
+  autopaste up  paste clips from the iPad automatically as they arrive
+  autopaste down  back to normal
+
+  rarely: clip test | clip hist | clip check | clip net | clip key
+
+USAGE
+    exec "$BIN/clipdoctor" --steps ;;
+  *)
+    echo "clip: unknown command '$1'" >&2
+    echo "try: clip help" >&2
+    exit 1 ;;
+esac

@@ -1,0 +1,164 @@
+#!/bin/bash
+# clipstatus — which route works on this network, and is the clipboard healthy?
+#
+# Answers one question first: can the iPad reach this Mac by plain SSH here,
+# or does it need Tailscale? Detected, not guessed — when Tailscale is up, a
+# relayed peer connection proves the network blocks device-to-device traffic.
+#
+# No `set -o pipefail`: `grep -q` exits on first match, the SIGPIPE fails the
+# upstream command, and checks silently invert.
+
+SUPPORT="$HOME/Library/Application Support/ClipBridge"
+LOG="$SUPPORT/prefetch.log"
+
+if [ -t 1 ]; then
+  G=$'\033[32m'; Y=$'\033[33m'; R=$'\033[31m'; B=$'\033[1m'; D=$'\033[2m'; N=$'\033[0m'
+else
+  G=""; Y=""; R=""; B=""; D=""; N=""
+fi
+
+TS=""
+for c in /Applications/Tailscale.app/Contents/MacOS/Tailscale \
+         /opt/homebrew/bin/tailscale /usr/local/bin/tailscale; do
+  [ -x "$c" ] && { TS="$c"; break; }
+done
+[ -n "${TAILSCALE_BIN:-}" ] && TS="$TAILSCALE_BIN"
+[ -n "$TS" ] && [ ! -x "$TS" ] && TS=""
+
+LOCAL_HOST="$(scutil --get LocalHostName 2>/dev/null).local"
+TS_HOST=""
+[ -n "$TS" ] && TS_HOST=$("$TS" status --json 2>/dev/null | python3 -c '
+import sys,json
+try: print((json.load(sys.stdin).get("Self") or {}).get("DNSName","").rstrip("."))
+except Exception: print("")' 2>/dev/null)
+
+NETFILE="$SUPPORT/networks.tsv"
+gwmac=$(arp -n "$(route -n get default 2>/dev/null | awk '/gateway/{print $2}')" 2>/dev/null | awk '{print $4}' | head -1)
+
+if [ "${1:-}" = "--networks" ]; then
+  echo
+  echo "${B}NETWORKS SEEN${N}  ${D}which ones need Tailscale${N}"
+  if [ -s "$NETFILE" ]; then
+    printf "  %-20s %-10s %s\n" "GATEWAY MAC" "ROUTE" "LAST SEEN"
+    sort -k2 "$NETFILE" | while IFS=$'\t' read -r mac v seen; do
+      case "$v" in
+        tailscale) printf "  %-20s ${Y}%-10s${N} %s\n" "$mac" "tailscale" "$seen" ;;
+        local)     printf "  %-20s ${G}%-10s${N} %s\n" "$mac" "local" "$seen" ;;
+        *)         printf "  %-20s ${D}%-10s${N} %s\n" "$mac" "$v" "$seen" ;;
+      esac
+    done
+    echo
+    echo "  ${D}Networks marked 'tailscale' are the exceptions to name in your Shortcut.${N}"
+  else
+    echo "  ${D}none recorded yet${N}"
+  fi
+  echo
+  exit 0
+fi
+
+echo
+echo "${B}ROUTE FOR THIS NETWORK${N}"
+
+verdict=""
+# Strongest signal: if Tailscale is up, ask it how it reaches the iPad. A relay
+# means the network blocks peer traffic, so plain SSH cannot work either.
+if [ -n "$TS" ]; then
+  peer=$("$TS" status --json 2>/dev/null | python3 -c '
+import sys,json
+try:
+    d=json.load(sys.stdin)
+    for p in (d.get("Peer") or {}).values():
+        if p.get("OS") in ("iOS","ipados"):
+            print((p.get("TailscaleIPs") or [""])[0] if p.get("Online") else ""); break
+except Exception: pass' 2>/dev/null)
+  if [ -n "$peer" ]; then
+    # Several packets, not one. Tailscale opens on a relay and upgrades to a
+    # direct path a beat later, so the FIRST packet is usually relayed even on
+    # a completely open network. Any direct reply proves peer traffic works.
+    probe=$("$TS" ping --c 4 --timeout 8s "$peer" 2>&1)
+    direct=$(echo "$probe" | grep "pong" | grep -v "DERP" | head -1)
+    if [ -n "$direct" ]; then
+      addr=$(echo "$direct" | sed -n 's/.*via \([0-9][^ ]*\).*/\1/p')
+      verdict="local"; why="direct connection to the iPad at ${addr:-its LAN address}"
+    elif echo "$probe" | grep "DERP" >/dev/null 2>&1; then
+      verdict="tailscale"; why="iPad reachable only through a relay (this network blocks peers, or the iPad is elsewhere)"
+    fi
+  fi
+fi
+
+# Fallback when Tailscale is off: do any LAN neighbours answer at all?
+if [ -z "$verdict" ]; then
+  gw=$(route -n get default 2>/dev/null | awk '/gateway/{print $2}')
+  me=$(ipconfig getifaddr en0 2>/dev/null)
+  # Only real unicast neighbours. Broadcast (ff:ff:...) and multicast groups
+  # (01:00:5e:...) always answer a ping and are not peers — counting them
+  # reported "direct SSH works" on a network that blocks every actual device.
+  peers=$(arp -an 2>/dev/null | awk '
+      { gsub(/[()]/,"",$2); ip=$2; mac=$4 }
+      mac == "(incomplete)"        { next }
+      mac == "ff:ff:ff:ff:ff:ff"   { next }
+      mac ~ /^1:0:5e:/             { next }
+      ip ~ /\.255$/                { next }
+      ip ~ /^(22[4-9]|23[0-9])\./  { next }
+      { print ip }' \
+      | grep -v "^$gw$" | grep -v "^$me$" | head -4)
+  hit=0; tried=0
+  for h in $peers; do tried=$((tried+1)); ping -c 1 -W 600 "$h" >/dev/null 2>&1 && hit=$((hit+1)); done
+  if [ "$tried" -eq 0 ]; then verdict="unknown"; why="no neighbours online to test against"
+  elif [ "$hit" -gt 0 ]; then verdict="local"; why="$hit of $tried neighbours replied"
+  else verdict="tailscale"; why="$tried neighbours silent, gateway fine"; fi
+fi
+
+# Remember what this network turned out to be, so the exception list can be
+# built from observation rather than guessed at.
+if [ -n "$gwmac" ] && [ "$gwmac" != "(incomplete)" ] && [ "$verdict" != "unknown" ] && [ -n "$verdict" ]; then
+  touch "$NETFILE"
+  grep -v "^$gwmac	" "$NETFILE" > "$NETFILE.tmp" 2>/dev/null
+  printf '%s\t%s\t%s\n' "$gwmac" "$verdict" "$(date '+%Y-%m-%d %H:%M')" >> "$NETFILE.tmp"
+  mv "$NETFILE.tmp" "$NETFILE"
+fi
+
+case "$verdict" in
+  local)
+    echo "  ${G}DIRECT SSH WORKS HERE${N}  ${D}Tailscale not needed${N}"
+    echo "  ${D}$why${N}"
+    echo "  Host: ${B}$LOCAL_HOST${N}" ;;
+  tailscale)
+    echo "  ${Y}TAILSCALE NEEDED${N}  ${D}this network blocks direct SSH${N}"
+    echo "  ${D}$why${N}"
+    echo "  Turn Tailscale ${B}ON${N} on the iPad."
+    [ -n "$TS_HOST" ] && echo "  Host: ${B}$TS_HOST${N}" ;;
+  *)
+    echo "  ${D}Cannot tell — $why${N}"
+    echo "  ${D}Try the local Shortcut; if it fails, turn Tailscale on.${N}" ;;
+esac
+
+echo
+echo "${B}CLIPBOARD HEALTH${N}  ${D}the automatic route${N}"
+ok=1
+if pgrep -x sharingd >/dev/null 2>&1; then
+  echo "  ${G}o${N} running ${D}(up $(ps -o etime= -p "$(pgrep -x sharingd | head -1)" | tr -d ' '))${N}"
+else
+  echo "  ${R}x${N} clipboard sharing not running"; ok=0
+fi
+crashes=$(find "$HOME/Library/Logs/DiagnosticReports" -name 'sharingd-*.ips' -mtime -1 2>/dev/null | wc -l | tr -d ' ')
+[ "${crashes:-0}" -gt 0 ] && echo "  ${Y}!${N} crashed $crashes time(s) in the last 24h"
+last=$(grep 'REMOTE' "$LOG" 2>/dev/null | tail -1 | sed -n 's/^\[\([^]]*\)\].*/\1/p')
+[ -n "$last" ] && python3 - "$last" <<'PY'
+import sys, datetime
+t=datetime.datetime.strptime(sys.argv[1],"%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
+m=(datetime.datetime.now(datetime.timezone.utc)-t).total_seconds()/60
+ago = "%d min ago"%m if m<60 else ("%.1f hours ago"%(m/60) if m<1440 else "%.1f days ago"%(m/1440))
+# Over two hours of silence is worth flagging: the Mac can look perfectly
+# healthy while the iPad has quietly stopped announcing.
+if m > 120:
+    print("  ! last iPad copy %s - if you have copied since, the fault is on the iPad" % ago)
+else:
+    print("  o last iPad copy %s" % ago)
+PY
+listening=$(netstat -an 2>/dev/null | grep -E "\.22 .*LISTEN")
+[ -n "$listening" ] || { echo "  ${R}x${N} sshd not listening — both Shortcuts will fail"; ok=0; }
+[ "$ok" -eq 1 ] && echo "  ${G}o${N} sshd listening"
+echo
+echo "  ${D}Paste came up empty?  clip last${N}"
+echo

@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Template. See the note in the prefetch template. -->
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.sikai.clipbridge.watch</string>
+    <key>ProgramArguments</key>
+    <array><string>__CLIPBRIDGE_DIR__/bin/clipwatch</string></array>
+    <key>RunAtLoad</key><true/>
+    <key>StartInterval</key><integer>60</integer>
+    <key>StandardOutPath</key><string>__HOME__/Library/Application Support/ClipBridge/watch.out</string>
+    <key>StandardErrorPath</key><string>__HOME__/Library/Application Support/ClipBridge/watch.err</string>
+</dict>
+</plist>

@@ -1,0 +1,63 @@
+#!/bin/bash
+# clip-endpoint — print the address to put in the Shortcut's Host field.
+#
+# Prefers the Tailscale address, which works from any network and survives
+# the client isolation on managed Wi-Fi. Falls back to the LAN address, which
+# only works when both devices are on a network that permits peer traffic.
+
+set -o pipefail
+
+TS=""
+for c in /Applications/Tailscale.app/Contents/MacOS/Tailscale \
+         /usr/local/bin/tailscale /opt/homebrew/bin/tailscale; do
+  [ -x "$c" ] && { TS="$c"; break; }
+done
+command -v tailscale >/dev/null 2>&1 && [ -z "$TS" ] && TS=$(command -v tailscale)
+
+echo "Shortcut connection settings"
+echo
+
+if [ -z "$TS" ]; then
+  echo "  Tailscale:  not installed"
+  echo "              brew install --cask tailscale-app"
+else
+  ts_ip=$("$TS" ip -4 2>/dev/null | head -1)
+  if [ -z "$ts_ip" ]; then
+    echo "  Tailscale:  installed but not connected — open Tailscale and sign in"
+  else
+    ts_name=$("$TS" status --json 2>/dev/null | python3 -c '
+import sys,json
+try:
+    d=json.load(sys.stdin)
+    print((d.get("Self") or {}).get("DNSName","").rstrip("."))
+except Exception:
+    print("")' 2>/dev/null)
+    echo "  Host:       ${ts_name:-$ts_ip}      <- use this"
+    [ -n "$ts_name" ] && echo "  (or IP):    $ts_ip"
+    echo "  Port:       22"
+    echo "  User:       $(whoami)"
+    echo
+    peers=$("$TS" status 2>/dev/null | grep -cvE '^$|^#')
+    echo "  Devices on your tailnet: $peers"
+    echo "  The iPad must appear in that list, signed into the same account."
+  fi
+fi
+
+echo
+lan=$(ipconfig getifaddr en0 2>/dev/null)
+echo "  LAN address: ${lan:-none}  (blocked by client isolation on this network)"
+echo
+
+# Captured rather than piped into `grep -q`: grep exits on first match, the
+# SIGPIPE fails netstat, and `set -o pipefail` would report a false negative.
+listening=$(netstat -an 2>/dev/null | grep -E "\.22 .*LISTEN")
+if [ -n "$listening" ]; then
+  echo "  sshd:       listening on port 22"
+else
+  echo "  sshd:       NOT listening — sudo systemsetup -setremotelogin on"
+fi
+if [ -s "$HOME/.ssh/authorized_keys" ]; then
+  echo "  Keys:       $(grep -c . "$HOME/.ssh/authorized_keys") authorised"
+else
+  echo "  Keys:       none — run clip key with the iPad key on the clipboard"
+fi
