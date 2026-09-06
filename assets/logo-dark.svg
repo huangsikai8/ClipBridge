@@ -1,9 +1,7 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 440 120" width="440" height="120"
      role="img" aria-label="ClipBridge — iPad and Mac clipboard, made reliable">
   <title>ClipBridge</title>
-  <!-- Turned 45°: the conventional orientation for a link, and it squares the
-       mark up so it balances the wordmark. -->
-  <g transform="translate(64,60) scale(0.9) rotate(-45) translate(-60,-48)">
+  <g transform="translate(6,12)">
       <defs>
         <!-- The lower crossing, where the accent link passes back over the ink
              one. Without this the two shapes merely overlap and read flat. -->

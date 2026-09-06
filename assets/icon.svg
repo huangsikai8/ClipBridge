@@ -7,7 +7,7 @@
       :root { --ink: #E6EDF3; --accent: #2DD4BF; }
     }
   </style>
-  <g transform="translate(60,60) rotate(-45) translate(-60,-48)">
+  <g transform="translate(0,12)">
       <defs>
         <!-- The lower crossing, where the accent link passes back over the ink
              one. Without this the two shapes merely overlap and read flat. -->
